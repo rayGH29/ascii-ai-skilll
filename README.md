@@ -28,7 +28,10 @@ python3 ascii_ai.py text --list-fonts
 |---|---|
 | `--width N` | Output width in characters (default 80) |
 | `--aspect F` | Vertical aspect correction (default 0.55) |
-| `--mode {brightness,edges,combined}` | Luminance ramp, DoG+Sobel structural edges, or both |
+| `--mode {brightness,edges,combined,detail,braille,halfblock}` | ramp · DoG+Sobel edges · both · glyph/shape matching · 2×4 braille dots · `▀` fg/bg color |
+| `--dither-mode {floyd,atkinson,stucki}` | Error-diffusion kernel (with `--dither`) |
+| `--autocontrast` / `--equalize` / `--sharpen F` | Pre-processing for extra detail |
+| `--cell HxW` / `--font-file` | `detail`-mode match block and glyph font |
 | `--charset {detailed,standard,simple,blocks,custom}` | Character ramp (`detailed` = Paul Bourke's 70-glyph) |
 | `--chars "..."` | Custom ramp, dark→light (with `--charset custom`) |
 | `--invert` | Flip brightness→glyph mapping |
@@ -57,4 +60,11 @@ bash .claude/skills/run-ascii-ai/driver.sh   # -> "ALL GREEN"
   ramp.
 - **Edges:** Difference-of-Gaussians preprocessing → Sobel gradients → magnitude
   thresholds a cell and `atan2(gy, gx)` orientation picks one of `| / - \`.
+- **Detail:** each cell's sub-pixel block is matched to the best-fitting real
+  font glyph (nearest-template search) — structure, not just density
+  ([Xu, Zhang & Wong, *Structure-based ASCII Art*, 2010](https://ttwong12.github.io/papers/asciiart/asciiart.pdf)).
+- **Braille:** 2×4 dots per cell (U+2800–U+28FF) → 8× spatial resolution, with
+  Floyd/Atkinson/Stucki dithering.
+- **Halfblock:** `▀` with foreground = top pixel and background = bottom pixel,
+  doubling vertical resolution in true color (the chafa/viu approach).
 - **Text:** [pyfiglet](https://pypi.org/project/pyfiglet/) FIGlet fonts.

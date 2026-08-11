@@ -85,6 +85,15 @@ check "invert"               200 "$PYTHON" "$APP" image "$IMG" --width 60 --inve
 check "custom charset"       200 "$PYTHON" "$APP" image "$IMG" --width 40 --charset custom --chars " .:oO@"
 check "ansi color output"    500 "$PYTHON" "$APP" image "$IMG" --width 40 --color ansi --output ansi
 
+echo "== upgraded modes =="
+check "detail (glyph match)" 200 "$PYTHON" "$APP" image "$IMG" --width 70 --mode detail
+check "detail + color"       500 "$PYTHON" "$APP" image "$IMG" --width 50 --mode detail --color ansi --output ansi
+check "braille"              200 "$PYTHON" "$APP" image "$IMG" --width 60 --mode braille
+check "braille + dither"     200 "$PYTHON" "$APP" image "$IMG" --width 60 --mode braille --dither --dither-mode atkinson
+check "halfblock (color)"    500 "$PYTHON" "$APP" image "$IMG" --width 40 --mode halfblock --output ansi
+check "dither stucki"        200 "$PYTHON" "$APP" image "$IMG" --width 60 --charset blocks --dither --dither-mode stucki
+check "preprocess flags"     200 "$PYTHON" "$APP" image "$IMG" --width 60 --autocontrast --equalize --sharpen 1.5
+
 echo "== html output (file) =="
 "$PYTHON" "$APP" image "$IMG" --width 80 --mode combined --color ansi --output html --out "$WORK/out.html" 2>/dev/null
 if [ -s "$WORK/out.html" ] && grep -q "<pre" "$WORK/out.html"; then

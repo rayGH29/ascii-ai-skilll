@@ -4,22 +4,31 @@ ascii_ai — convert an image or text into ASCII art.
 
 Two subcommands:
 
-    image  <path>   Convert a raster image into ASCII, with several rendering
-                    modes (brightness ramp, structural edge detection, or both),
-                    optional 24-bit ANSI color, dithering, and text/ansi/html
-                    output.
+    image  <path>   Convert a raster image into ASCII. Rendering modes:
+                      brightness  luminance -> character ramp (fast, classic)
+                      edges       DoG + Sobel structural strokes ( | / - \\ )
+                      combined    edges drawn over the brightness fill
+                      detail      glyph/shape matching against real font
+                                  bitmaps — highest structural fidelity
+                      braille     2x4 Unicode braille dots — 8x resolution
+                      halfblock   ▀ half-block color — 2x vertical, photographic
+                    Plus 24-bit ANSI color, dithering (floyd/atkinson/stucki),
+                    pre-processing (autocontrast/equalize/sharpen), and
+                    text/ansi/html output.
 
     text   <string> Render a string as a large FIGlet-style banner (pyfiglet).
 
-The image pipeline is NumPy-vectorized: the luminance grid is mapped to the
-character ramp with a single indexed lookup rather than a per-pixel Python loop,
-so even the 70-glyph "detailed" ramp on a wide render stays fast.
+The image pipeline is NumPy-vectorized: ramp mapping is a single indexed
+lookup, and glyph matching is a single nearest-template search
+(cells · templatesᵀ), so even wide renders stay fast.
 
 References that informed the algorithms:
   - Paul Bourke's ASCII grayscale ramps   (paulbourke.net/dataformats/asciiart/)
   - luminance = 0.299 R + 0.587 G + 0.114 B, ~0.55 vertical aspect correction
-  - Difference-of-Gaussians + Sobel structural ASCII ("ASCII camera" approach):
-    edge magnitude thresholds a cell, atan2(gy, gx) angle picks one of | / - \\
+  - Difference-of-Gaussians + Sobel structural ASCII
+  - Structure-based ASCII art via glyph/shape matching (Xu, Zhang, Wong, 2010)
+  - Braille (U+2800..U+28FF) 2x4 dot cells; Floyd/Atkinson/Stucki dithering
+  - Half-block ▀ fg/bg color rendering (chafa/viu approach)
 """
 from __future__ import annotations
 
@@ -48,21 +57,43 @@ RAMPS = {
 #   0 -> horizontal edge, 1 -> diagonal /, 2 -> vertical, 3 -> diagonal \
 EDGE_CHARS = ["-", "/", "|", "\\"]
 
+# Error-diffusion dithering kernels: (divisor, [(dx, dy, weight), ...]).
+DITHER_KERNELS = {
+    "floyd": (16, [(1, 0, 7), (-1, 1, 3), (0, 1, 5), (1, 1, 1)]),
+    "atkinson": (8, [(1, 0, 1), (2, 0, 1), (-1, 1, 1), (0, 1, 1),
+                     (1, 1, 1), (0, 2, 1)]),
+    "stucki": (42, [(1, 0, 8), (2, 0, 4),
+                    (-2, 1, 2), (-1, 1, 4), (0, 1, 8), (1, 1, 4), (2, 1, 2),
+                    (-2, 2, 1), (-1, 2, 2), (0, 2, 4), (1, 2, 2), (2, 2, 1)]),
+}
+
+# Default candidate glyph set for `detail` mode (printable ASCII, space first).
+DETAIL_GLYPHS = (
+    " `.-':_,^=;><+!rc*/z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@"
+)
+
+FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
+]
+
 
 def eprint(*args: object) -> None:
     print(*args, file=sys.stderr)
 
 
-# ---------------------------------------------------------------------------
-# Image helpers
-# ---------------------------------------------------------------------------
-def load_grid(path: str, width: int, aspect: float):
-    """Load an image, resize to the ASCII grid, return (gray, rgb) float arrays.
+def _luminance(rgb: np.ndarray) -> np.ndarray:
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    return (0.299 * r + 0.587 * g + 0.114 * b).astype(np.float32)
 
-    gray: (rows, cols) luminance in [0, 255]
-    rgb:  (rows, cols, 3) uint8, aligned to the same grid (for color output)
-    """
-    from PIL import Image
+
+# ---------------------------------------------------------------------------
+# Image loading + preprocessing
+# ---------------------------------------------------------------------------
+def open_image(path, autocontrast=False, equalize=False, sharpen=0.0):
+    """Open an RGB image and apply optional detail-boosting preprocessing."""
+    from PIL import Image, ImageOps, ImageFilter
 
     try:
         img = Image.open(path).convert("RGB")
@@ -73,16 +104,38 @@ def load_grid(path: str, width: int, aspect: float):
         eprint(f"error: could not open image {path!r}: {exc}")
         sys.exit(2)
 
+    if sharpen and sharpen > 0:
+        img = img.filter(ImageFilter.UnsharpMask(
+            radius=2, percent=int(sharpen * 100), threshold=2))
+    if equalize:
+        img = ImageOps.equalize(img)
+    if autocontrast:
+        img = ImageOps.autocontrast(img, cutoff=1)
+    return img
+
+
+def grid_dims(img, width, aspect):
     w, h = img.size
     cols = max(1, width)
-    # Each character cell is taller than wide; scale height by `aspect`.
     rows = max(1, int(round(cols * (h / w) * aspect)))
-    img = img.resize((cols, rows), Image.LANCZOS)
+    return cols, rows
 
-    rgb = np.asarray(img, dtype=np.uint8)
-    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
-    gray = 0.299 * r + 0.587 * g + 0.114 * b
-    return gray.astype(np.float32), rgb
+
+def sample(img, cols, rows):
+    """Resize to (cols, rows) and return (gray, rgb) aligned arrays."""
+    from PIL import Image
+
+    im = img.resize((cols, rows), Image.LANCZOS)
+    rgb = np.asarray(im, dtype=np.uint8)
+    return _luminance(rgb), rgb
+
+
+def load_grid(path, width, aspect, autocontrast=False, equalize=False,
+              sharpen=0.0):
+    """Back-compat helper: preprocess, size the char grid, sample once."""
+    img = open_image(path, autocontrast, equalize, sharpen)
+    cols, rows = grid_dims(img, width, aspect)
+    return sample(img, cols, rows)
 
 
 def apply_gamma(gray: np.ndarray, gamma: float) -> np.ndarray:
@@ -92,11 +145,16 @@ def apply_gamma(gray: np.ndarray, gamma: float) -> np.ndarray:
     return norm * 255.0
 
 
-def floyd_steinberg(gray: np.ndarray, levels: int) -> np.ndarray:
-    """Quantize `gray` (0..255) to `levels` bins with Floyd-Steinberg dithering.
+# ---------------------------------------------------------------------------
+# Dithering
+# ---------------------------------------------------------------------------
+def error_diffuse(gray: np.ndarray, levels: int, mode: str) -> np.ndarray:
+    """Quantize `gray` (0..255) to `levels` bins with error-diffusion dithering.
 
-    Returns an integer array of bin indices in [0, levels-1].
+    Returns integer bin indices in [0, levels-1]. `mode` selects the kernel
+    (floyd / atkinson / stucki).
     """
+    div, kern = DITHER_KERNELS[mode]
     work = gray.astype(np.float32).copy()
     rows, cols = work.shape
     step = 255.0 / (levels - 1) if levels > 1 else 255.0
@@ -106,39 +164,34 @@ def floyd_steinberg(gray: np.ndarray, levels: int) -> np.ndarray:
             new = round(old / step) * step
             work[y, x] = new
             err = old - new
-            if x + 1 < cols:
-                work[y, x + 1] += err * 7 / 16
-            if y + 1 < rows:
-                if x > 0:
-                    work[y + 1, x - 1] += err * 3 / 16
-                work[y + 1, x] += err * 5 / 16
-                if x + 1 < cols:
-                    work[y + 1, x + 1] += err * 1 / 16
-    idx = np.clip(np.round(work / step), 0, levels - 1).astype(np.int32)
-    return idx
+            for dx, dy, w in kern:
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < cols and 0 <= ny < rows:
+                    work[ny, nx] += err * w / div
+    return np.clip(np.round(work / step), 0, levels - 1).astype(np.int32)
 
 
-def brightness_indices(gray: np.ndarray, ramp: str, invert: bool,
-                       dither: bool) -> np.ndarray:
+def floyd_steinberg(gray: np.ndarray, levels: int) -> np.ndarray:
+    """Back-compat wrapper: Floyd-Steinberg quantization to `levels` bins."""
+    return error_diffuse(gray, levels, "floyd")
+
+
+def brightness_indices(gray, ramp, invert, dither, dither_mode="floyd"):
     """Map luminance to indices into `ramp` (0 == darkest glyph)."""
     n = len(ramp)
     if dither:
-        idx = floyd_steinberg(gray, n)          # 0 == dark bin
+        idx = error_diffuse(gray, n, dither_mode)   # 0 == dark bin
     else:
         idx = np.clip((gray / 255.0) * (n - 1), 0, n - 1).astype(np.int32)
     if not invert:
-        # Brighter pixels should use lighter (higher-index) glyphs already;
-        # ramps are ordered dark->light so a bright pixel -> high index. Good.
         return idx
     return (n - 1) - idx
 
 
+# ---------------------------------------------------------------------------
+# Structural edges (DoG + Sobel)
+# ---------------------------------------------------------------------------
 def sobel_edges(gray: np.ndarray, dog_sigma: float):
-    """Difference-of-Gaussians preprocess, then Sobel. Return (mag, angle_idx).
-
-    mag:       normalized edge magnitude in [0, 1]
-    angle_idx: quantized orientation 0..3 indexing EDGE_CHARS
-    """
     from PIL import Image, ImageFilter
 
     src = Image.fromarray(np.clip(gray, 0, 255).astype(np.uint8))
@@ -147,7 +200,7 @@ def sobel_edges(gray: np.ndarray, dog_sigma: float):
                         dtype=np.float32)
         g2 = np.asarray(src.filter(ImageFilter.GaussianBlur(dog_sigma * 1.6)),
                         dtype=np.float32)
-        base = g1 - g2                      # difference of gaussians
+        base = g1 - g2
     else:
         base = gray.astype(np.float32)
 
@@ -161,20 +214,17 @@ def sobel_edges(gray: np.ndarray, dog_sigma: float):
     if mmax > 0:
         mag = mag / mmax
 
-    # Orientation of the edge line (perpendicular to gradient), 0..pi.
-    theta = np.arctan2(gy, gx)              # -pi..pi (gradient direction)
+    theta = np.arctan2(gy, gx)
     deg = (np.degrees(theta) + 180.0) % 180.0
-    # Bucket into 4 orientations centered on 0/45/90/135.
     angle_idx = np.zeros_like(deg, dtype=np.int32)
-    angle_idx[(deg >= 22.5) & (deg < 67.5)] = 3    # gradient ~45 -> edge "\"
-    angle_idx[(deg >= 67.5) & (deg < 112.5)] = 0   # gradient ~90 -> edge "-"
-    angle_idx[(deg >= 112.5) & (deg < 157.5)] = 1  # gradient ~135 -> edge "/"
-    angle_idx[(deg >= 157.5) | (deg < 22.5)] = 2   # gradient ~0 -> edge "|"
+    angle_idx[(deg >= 22.5) & (deg < 67.5)] = 3
+    angle_idx[(deg >= 67.5) & (deg < 112.5)] = 0
+    angle_idx[(deg >= 112.5) & (deg < 157.5)] = 1
+    angle_idx[(deg >= 157.5) | (deg < 22.5)] = 2
     return mag, angle_idx
 
 
 def _convolve3(a: np.ndarray, k: np.ndarray) -> np.ndarray:
-    """3x3 convolution with edge padding, pure NumPy (no scipy)."""
     p = np.pad(a, 1, mode="edge")
     out = np.zeros_like(a, dtype=np.float32)
     for dy in range(3):
@@ -184,36 +234,175 @@ def _convolve3(a: np.ndarray, k: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Renderers
+# detail mode — glyph/shape matching against real font bitmaps
+# ---------------------------------------------------------------------------
+def _resolve_font(font_file):
+    from PIL import ImageFont
+
+    candidates = [font_file] if font_file else []
+    candidates += FONT_CANDIDATES
+    for path in candidates:
+        if not path:
+            continue
+        try:
+            return path, ImageFont.truetype(path, 16)  # size set later
+        except Exception:
+            continue
+    return None, ImageFont.load_default()
+
+
+def build_templates(glyphs, ch, cw, font_file):
+    """Render each glyph to a (ch*cw) ink-coverage vector in [0,1]."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    path, _ = _resolve_font(font_file)
+    if path:
+        font = ImageFont.truetype(path, ch)
+    else:
+        font = ImageFont.load_default()
+
+    tpls = []
+    for gch in glyphs:
+        im = Image.new("L", (cw, ch), 0)          # black background
+        d = ImageDraw.Draw(im)
+        try:
+            bbox = d.textbbox((0, 0), gch, font=font)
+        except Exception:
+            bbox = (0, 0, cw, ch)
+        gw = bbox[2] - bbox[0]
+        gh = bbox[3] - bbox[1]
+        x = (cw - gw) / 2 - bbox[0]
+        y = (ch - gh) / 2 - bbox[1]
+        d.text((x, y), gch, fill=255, font=font)   # white ink
+        tpls.append((np.asarray(im, dtype=np.float32) / 255.0).reshape(-1))
+    return np.stack(tpls)                           # (G, ch*cw)
+
+
+def render_detail(img, cols, rows, args):
+    """Match every cell's sub-pixel block to the best-fitting glyph."""
+    ch, cw = args.cell                              # (height, width) in px
+    glyphs = args.glyphs or DETAIL_GLYPHS
+    templates = build_templates(glyphs, ch, cw, args.font_file)   # (G, D)
+
+    gray, _ = sample(img, cols * cw, rows * ch)     # hi-res luminance
+    gray = apply_gamma(gray, args.gamma)
+    dark = 1.0 - np.clip(gray / 255.0, 0, 1)        # ink = darkness
+    if args.invert:
+        dark = 1.0 - dark
+
+    # (rows, ch, cols, cw) -> (rows*cols, ch*cw)
+    blocks = (dark.reshape(rows, ch, cols, cw)
+                  .transpose(0, 2, 1, 3)
+                  .reshape(rows * cols, ch * cw))
+    # argmin_g ||block - tpl||^2 ; drop the constant ||block||^2 term.
+    tpl2 = (templates ** 2).sum(axis=1)             # (G,)
+    dist = tpl2[None, :] - 2.0 * (blocks @ templates.T)
+    idx = dist.argmin(axis=1)
+    char_grid = np.array(list(glyphs))[idx].reshape(rows, cols)
+
+    fg = None
+    if args.color == "ansi":
+        _, rgb = sample(img, cols, rows)
+        fg = rgb
+    return char_grid, fg
+
+
+# ---------------------------------------------------------------------------
+# braille mode — 2x4 Unicode dot cells (U+2800..U+28FF)
+# ---------------------------------------------------------------------------
+# Dot bit for (col in {0,1}, row in {0,1,2,3}) per the Unicode braille layout.
+_BRAILLE_BIT = {
+    (0, 0): 0x01, (0, 1): 0x02, (0, 2): 0x04, (0, 3): 0x40,
+    (1, 0): 0x08, (1, 1): 0x10, (1, 2): 0x20, (1, 3): 0x80,
+}
+
+
+def render_braille(img, cols, rows, args):
+    gray, _ = sample(img, cols * 2, rows * 4)       # dot resolution
+    gray = apply_gamma(gray, args.gamma)
+    dark = gray if not args.invert else (255.0 - gray)
+
+    if args.dither:
+        # index 0 == darkest bin == dot ON
+        on = (error_diffuse(dark, 2, args.dither_mode) == 0)
+    else:
+        on = dark < (args.threshold * 255.0)
+
+    masks = np.zeros((rows, cols), dtype=np.int32)
+    for (c, r), bit in _BRAILLE_BIT.items():
+        masks += bit * on[r::4, c::2][:rows, :cols].astype(np.int32)
+    char_grid = np.array([chr(0x2800 + m) for m in masks.ravel()],
+                         dtype="<U1").reshape(rows, cols)
+
+    fg = None
+    if args.color == "ansi":
+        _, rgb = sample(img, cols, rows)
+        fg = rgb
+    return char_grid, fg
+
+
+# ---------------------------------------------------------------------------
+# halfblock mode — ▀ with fg=top pixel, bg=bottom pixel (2x vertical, color)
+# ---------------------------------------------------------------------------
+def render_halfblock(img, cols, rows, args):
+    _, rgb = sample(img, cols, rows * 2)            # two stacked pixels/char
+    top = rgb[0::2][:rows]
+    bot = rgb[1::2][:rows]
+    char_grid = np.full((rows, cols), "▀", dtype="<U1")
+    return char_grid, top, bot
+
+
+# ---------------------------------------------------------------------------
+# Renderers / emit
 # ---------------------------------------------------------------------------
 def render_image(args) -> str:
+    img = open_image(args.path, args.autocontrast, args.equalize, args.sharpen)
+    cols, rows = grid_dims(img, args.width, args.aspect)
+
+    if args.mode == "detail":
+        char_grid, fg = render_detail(img, cols, rows, args)
+        return _emit(char_grid, args, fg=fg)
+
+    if args.mode == "braille":
+        char_grid, fg = render_braille(img, cols, rows, args)
+        return _emit(char_grid, args, fg=fg)
+
+    if args.mode == "halfblock":
+        char_grid, fg, bg = render_halfblock(img, cols, rows, args)
+        return _emit(char_grid, args, fg=fg, bg=bg)
+
+    # ramp-based modes (brightness / edges / combined)
     ramp = args.chars if args.charset == "custom" else RAMPS[args.charset]
     if args.charset == "custom" and not ramp:
         eprint("error: --charset custom requires --chars \"...\"")
         sys.exit(2)
 
-    gray, rgb = load_grid(args.path, args.width, args.aspect)
+    gray, rgb = sample(img, cols, rows)
     gray = apply_gamma(gray, args.gamma)
 
-    rows, cols = gray.shape
-    # Base layer: characters chosen per cell.
     if args.mode in ("brightness", "combined"):
-        idx = brightness_indices(gray, ramp, args.invert, args.dither)
+        idx = brightness_indices(gray, ramp, args.invert, args.dither,
+                                 args.dither_mode)
         char_grid = np.array(list(ramp))[idx]
     else:
-        # edges-only: fill with spaces, edges drawn on top below.
         char_grid = np.full((rows, cols), " ", dtype="<U1")
 
     if args.mode in ("edges", "combined"):
         mag, angle_idx = sobel_edges(gray, args.dog)
         edge_mask = mag >= args.threshold
-        edge_chars = np.array(EDGE_CHARS)[angle_idx]
-        char_grid = np.where(edge_mask, edge_chars, char_grid)
+        char_grid = np.where(edge_mask, np.array(EDGE_CHARS)[angle_idx],
+                             char_grid)
 
-    return _emit(char_grid, rgb, args)
+    fg = rgb if args.color == "ansi" else None
+    return _emit(char_grid, args, fg=fg)
 
 
-def _emit(char_grid: np.ndarray, rgb: np.ndarray, args) -> str:
+def _emit(char_grid, args, fg=None, bg=None) -> str:
+    """Render the char grid to text / ansi / html.
+
+    fg: optional (rows, cols, 3) foreground colors.
+    bg: optional (rows, cols, 3) background colors (halfblock).
+    """
     rows, cols = char_grid.shape
     out_kind = args.output
 
@@ -222,43 +411,50 @@ def _emit(char_grid: np.ndarray, rgb: np.ndarray, args) -> str:
 
     if out_kind == "ansi":
         lines = []
-        colored = args.color == "ansi"
         for y in range(rows):
             parts = []
             for x in range(cols):
-                ch = char_grid[y, x]
-                if colored:
-                    r, g, b = (int(v) for v in rgb[y, x])
-                    parts.append(f"\x1b[38;2;{r};{g};{b}m{ch}")
-                else:
-                    parts.append(ch)
-            parts.append("\x1b[0m" if colored else "")
-            lines.append("".join(parts))
+                pre = ""
+                if fg is not None:
+                    r, g, b = (int(v) for v in fg[y, x])
+                    pre += f"\x1b[38;2;{r};{g};{b}m"
+                if bg is not None:
+                    r, g, b = (int(v) for v in bg[y, x])
+                    pre += f"\x1b[48;2;{r};{g};{b}m"
+                parts.append(pre + char_grid[y, x])
+            lines.append("".join(parts) + ("\x1b[0m" if (fg is not None
+                                                         or bg is not None)
+                                           else ""))
         return "\n".join(lines)
 
     if out_kind == "html":
         esc = {"&": "&amp;", "<": "&lt;", ">": "&gt;"}
         spans = []
-        colored = args.color == "ansi"
         for y in range(rows):
             row_parts = []
             for x in range(cols):
-                ch = char_grid[y, x]
-                ch = esc.get(ch, ch)
-                if colored:
-                    r, g, b = (int(v) for v in rgb[y, x])
+                ch = esc.get(char_grid[y, x], char_grid[y, x])
+                styles = []
+                if fg is not None:
+                    r, g, b = (int(v) for v in fg[y, x])
+                    styles.append(f"color:rgb({r},{g},{b})")
+                if bg is not None:
+                    r, g, b = (int(v) for v in bg[y, x])
+                    styles.append(f"background:rgb({r},{g},{b})")
+                if styles:
                     row_parts.append(
-                        f'<span style="color:rgb({r},{g},{b})">{ch}</span>')
+                        f'<span style="{";".join(styles)}">{ch}</span>')
                 else:
                     row_parts.append(ch)
             spans.append("".join(row_parts))
         body = "\n".join(spans)
-        bg = "#000" if not args.invert else "#fff"
-        fg = "#eee" if not args.invert else "#111"
+        page_bg = "#000" if not args.invert else "#fff"
+        page_fg = "#eee" if not args.invert else "#111"
         return (
             "<!doctype html><meta charset='utf-8'>"
-            f"<pre style=\"font: 8px/8px monospace; background:{bg}; "
-            f"color:{fg}; letter-spacing:0; padding:8px\">\n{body}\n</pre>"
+            f"<pre style=\"font: 8px/8px monospace; background:{page_bg}; "
+            f"color:{page_fg}; letter-spacing:0; line-height:1; "
+            f"padding:8px\">\n{body}\n</pre>"
         )
 
     raise ValueError(f"unknown output kind: {out_kind}")
@@ -272,7 +468,7 @@ def render_text(args) -> str:
 
     try:
         fig = Figlet(font=args.font, width=args.width)
-    except Exception:  # pyfiglet raises FontNotFound
+    except Exception:
         eprint(f"error: unknown font {args.font!r}. "
                f"Try `text --list-fonts` to see options.")
         sys.exit(2)
@@ -296,20 +492,30 @@ def _rgb_triple(s: str):
         raise argparse.ArgumentTypeError("expected R,G,B with each 0-255")
 
 
+def _cell(s: str):
+    try:
+        h, w = (int(p) for p in s.lower().split("x"))
+        assert h > 0 and w > 0
+        return (h, w)
+    except Exception:
+        raise argparse.ArgumentTypeError("expected HxW, e.g. 12x6")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ascii_ai",
         description="Convert an image or text into ASCII art.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    # image ----------------------------------------------------------------
     pi = sub.add_parser("image", help="convert an image file to ASCII")
     pi.add_argument("path", help="path to the source image")
     pi.add_argument("--width", type=int, default=80,
                     help="output width in characters (default 80)")
     pi.add_argument("--aspect", type=float, default=0.55,
                     help="vertical aspect correction (default 0.55)")
-    pi.add_argument("--mode", choices=["brightness", "edges", "combined"],
+    pi.add_argument("--mode",
+                    choices=["brightness", "edges", "combined", "detail",
+                             "braille", "halfblock"],
                     default="brightness")
     pi.add_argument("--charset",
                     choices=["detailed", "standard", "simple", "blocks",
@@ -320,21 +526,36 @@ def build_parser() -> argparse.ArgumentParser:
     pi.add_argument("--invert", action="store_true",
                     help="invert brightness->glyph mapping")
     pi.add_argument("--dither", action="store_true",
-                    help="Floyd-Steinberg dithering before ramp mapping")
+                    help="error-diffusion dithering (ramp & braille modes)")
+    pi.add_argument("--dither-mode", choices=["floyd", "atkinson", "stucki"],
+                    default="floyd", help="dithering kernel (default floyd)")
     pi.add_argument("--color", choices=["none", "ansi"], default="none")
     pi.add_argument("--output", choices=["text", "ansi", "html"],
                     default="text")
     pi.add_argument("--gamma", type=float, default=1.0,
                     help="gamma correction (>1 brightens midtones)")
     pi.add_argument("--threshold", type=float, default=0.15,
-                    help="edge magnitude threshold 0..1 (edges/combined)")
+                    help="edge/braille threshold 0..1")
     pi.add_argument("--dog", type=float, default=1.0,
                     help="difference-of-gaussians sigma (0 disables)")
+    # preprocessing (all modes)
+    pi.add_argument("--autocontrast", action="store_true",
+                    help="stretch contrast before converting")
+    pi.add_argument("--equalize", action="store_true",
+                    help="histogram-equalize before converting")
+    pi.add_argument("--sharpen", type=float, default=0.0,
+                    help="unsharp-mask amount, e.g. 1.5 (0 disables)")
+    # detail mode
+    pi.add_argument("--cell", type=_cell, default=(12, 6),
+                    help="detail cell size HxW in px (default 12x6)")
+    pi.add_argument("--glyphs", default="",
+                    help="detail candidate glyphs (default: built-in set)")
+    pi.add_argument("--font-file", default="",
+                    help="TTF used to render detail glyphs")
     pi.add_argument("--out", default="",
                     help="write to file instead of stdout")
     pi.set_defaults(func=render_image)
 
-    # text -----------------------------------------------------------------
     pt = sub.add_parser("text", help="render a string as a FIGlet banner")
     pt.add_argument("text", nargs="?", default="", help="text to render")
     pt.add_argument("--font", default="standard")
@@ -363,7 +584,6 @@ def main(argv=None) -> int:
         try:
             print(result)
         except BrokenPipeError:
-            # Downstream pipe (e.g. `| head`) closed early; exit quietly.
             try:
                 sys.stdout.close()
             except Exception:

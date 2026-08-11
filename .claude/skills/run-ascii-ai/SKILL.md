@@ -1,13 +1,17 @@
 ---
 name: run-ascii-ai
-description: Build, run, and drive the ascii_ai converter — turn an image or text into ASCII art. Use when asked to run/start ascii_ai, convert an image or a photo to ASCII, make ASCII art, render an image as text characters, build a FIGlet/text banner, produce colored/ANSI/HTML ASCII, or screenshot the ASCII output.
+description: Build, run, and drive the ascii_ai converter — turn an image or text into ASCII art. Use when asked to run/start ascii_ai, convert an image or a photo to ASCII, make ASCII art, render an image as text characters, glyph/braille/halfblock ASCII, build a FIGlet/text banner, produce colored/ANSI/HTML ASCII, or screenshot the ASCII output.
 ---
 
-`ascii_ai` is a self-contained Python CLI that converts **an image** (brightness
-ramp, structural edge detection, or both — with optional 24-bit ANSI color,
-dithering, and text/ansi/html output) or **a string** (FIGlet banner) into ASCII
-art. Drive it directly with `python3 ascii_ai.py ...`; the committed smoke
-harness `.claude/skills/run-ascii-ai/driver.sh` exercises every mode.
+`ascii_ai` is a self-contained Python CLI that converts **an image** or **a
+string** into ASCII art. Image modes: `brightness` (ramp), `edges` (DoG+Sobel
+strokes), `combined`, `detail` (glyph/shape matching — highest structural
+fidelity), `braille` (2×4 Unicode dots — 8× resolution), and `halfblock` (`▀`
+fg/bg true-color — near-photographic). Plus 24-bit color, dithering
+(floyd/atkinson/stucki), pre-processing (autocontrast/equalize/sharpen), and
+text/ansi/html output. Drive it directly with `python3 ascii_ai.py ...`; the
+committed smoke harness `.claude/skills/run-ascii-ai/driver.sh` exercises every
+mode.
 
 All paths below are relative to the repo root (the directory holding
 `ascii_ai.py`).
@@ -87,6 +91,23 @@ python3 ascii_ai.py image sample.png --width 60 --mode combined --color ansi --o
 python3 ascii_ai.py image sample.png --width 120 --mode combined --color ansi --output html --out out.html
 ```
 
+High-fidelity modes (best realism/detail — all verified this session):
+
+```bash
+# detail — glyph/shape matching against real font bitmaps (crisp structure).
+# --cell HxW sets the match block (default 12x6); --font-file overrides the TTF.
+python3 ascii_ai.py image sample.png --width 100 --mode detail --autocontrast
+
+# braille — 2x4 Unicode dot cells, 8x spatial resolution; dither for gradients.
+python3 ascii_ai.py image sample.png --width 80 --mode braille --dither --dither-mode atkinson
+
+# halfblock — ▀ with fg=top / bg=bottom pixel; forces color, near-photographic.
+python3 ascii_ai.py image sample.png --width 100 --mode halfblock --output html --out sphere.html
+
+# preprocessing (any mode): stretch contrast, equalize, unsharp-mask sharpen.
+python3 ascii_ai.py image sample.png --width 90 --autocontrast --equalize --sharpen 1.5
+```
+
 Text (FIGlet) mode:
 
 ```bash
@@ -133,6 +154,20 @@ prints is harmless — the PNG is still written.
   tones blur into noise; use `standard`/`simple` for narrow renders.
 - **The `text` subcommand needs a string OR `--list-fonts`.** Calling `text`
   with neither exits non-zero with a clear message.
+- **`detail` mode needs a monospace TTF.** It auto-finds DejaVuSansMono /
+  Liberation / FreeMono; if none exist it falls back to PIL's tiny bitmap font
+  and quality drops. Pass `--font-file /path/to/Mono.ttf` to be explicit. It's
+  the slowest mode but still sub-second at width 100 (renders ~95 glyph
+  templates once, then one vectorized nearest-template search).
+- **`braille` and `halfblock` need a capable viewer.** Braille glyphs require a
+  font with U+2800 coverage; `halfblock` needs a **truecolor** terminal (or use
+  `--output html` and screenshot, which always works). `halfblock` ignores
+  `--color`/`--charset` — it's always `▀` with fg+bg color.
+- **Black-background images fill with ink in mono modes.** `detail`/`braille`
+  treat dark pixels as glyphs, so a subject on black comes out dense; add
+  `--invert`, or use `halfblock` (color, so black stays black).
+- **`--dither-mode atkinson`** gives punchier line art (braille), **`stucki`**
+  smoother gradients, **`floyd`** (default) is the balanced middle.
 
 ## Troubleshooting
 
