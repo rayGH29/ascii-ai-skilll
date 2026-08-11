@@ -6,3 +6,11 @@ out.html
 *.pyc
 __pycache__/
 sample.html
+
+# generated demo/output artifacts (produced when driving the tool)
+eye.png
+top_eye.png
+top_eye_2tone.png
+all_seeing_eye.html
+all_seeing_eye.png
+*_ascii.txt
