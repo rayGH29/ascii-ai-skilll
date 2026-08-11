@@ -1,0 +1,8 @@
+# scratch artifacts produced when driving/testing the tool
+sample.png
+proof.png
+proof.html
+out.html
+*.pyc
+__pycache__/
+sample.html
